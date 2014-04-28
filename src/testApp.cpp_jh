@@ -1,0 +1,1242 @@
+#include "testApp.h"
+
+#define IsGenuine	((indexTrain==indexScale) ? true : false)
+vector<Point2f>	dst_matching_corners(4);
+
+
+//--------------------------------------------------------------
+void testApp::setup(){
+	ofSetFrameRate(60);
+
+	font.loadFont("verdana.TTF", 24);
+
+	// 카메라
+	//------------------------------
+	camera.initGrabber(640,480, true);
+
+	// 매칭 초기화
+	//------------------------------
+	matcher = new cv::BFMatcher(cv::NORM_HAMMING, false);
+
+	// BRISK 저자 코드
+	//------------------------------
+	brisk_from_author = new cv::GridAdaptedFeatureDetector(new cv::BriskFeatureDetector(40, 5));
+	//brisk_from_author = new cv::BriskFeatureDetector(40, 5);
+	descriptorExtractor_brisk = new cv::BriskDescriptorExtractor();
+
+	// FREAK 저자 코드
+	//------------------------------
+	descriptorExtractor_freak = new freak::FREAK();
+
+
+	// DB 영상 입력 및 키포인트/디스크립터 계산
+	//------------------------------
+	char path[100];
+	keyPointsTrainByBRISK.resize(NUMBER_OF_DB_IMAGES);
+	keyPointsTrainByFREAK.resize(NUMBER_OF_DB_IMAGES);
+	descriptorsTrainByBRISK.resize(NUMBER_OF_DB_IMAGES);
+	descriptorsTrainByFREAK.resize(NUMBER_OF_DB_IMAGES);
+	
+	matchedQuery.resize(NUMBER_OF_DB_IMAGES);
+	matchedTraining.resize(NUMBER_OF_DB_IMAGES);
+
+	imageCurrentMat = cv::Mat(cv::Size(640, 480), CV_8U);
+
+	for(int i=0; i<NUMBER_OF_DB_IMAGES; ++i)
+	{
+		sprintf(path, "train/%d.jpg", i+1);
+		imagesTrain[i].loadImage(path);
+
+
+		computeDescriptors(	&(imagesTrain[i]), 
+							&(keyPointsTrainByBRISK[i]),
+							&(keyPointsTrainByFREAK[i]),
+							&(descriptorsTrainByBRISK[i]),
+							&(descriptorsTrainByFREAK[i]));
+	}
+
+	// 트레킹 관련 초기화
+	//==============================
+	imageTracking[0] = cv::Mat(cv::Size(640, 480), CV_8U);
+	imageTracking[1] = cv::Mat(cv::Size(640, 480), CV_8U);
+
+	bTrackingModeEnabled = false;
+	beforeTrackingCount = 5;
+	bUseTrackingMode = false;
+
+
+	// 현재 이미지 세팅
+	imageCurrentQuery	= new	ofImage();
+
+	processDone = false;
+	bDrawLine = true;
+	BRISKMode = MODE::BRISKK;
+	bDrawWholeImages = false;
+	bDrawFourImages = false;
+	bDrawSixImages = false;
+	bDrawSingieImage = true;
+
+	MatchScoreThreshold = MATCH_SCORE_THRESHOLD;
+
+	// Object Load
+	ofDisableArbTex(); // we need GL_TEXTURE_2D for our models coords.
+
+	model.loadModel("france_1\\france_1.obj", true);
+	model.setScale(0.3, 0.3, 0.3);
+
+	_calib.LoadCalibParams(cvSize(640,480));
+
+}
+
+//--------------------------------------------------------------
+void testApp::update(){
+	camera.update();
+
+	if(camera.isFrameNew())
+	{
+		imageCurrentQuery->setFromPixels(camera.getPixels(),640,480,OF_IMAGE_COLOR);
+
+		if( bUseTrackingMode && bTrackingModeEnabled)
+		{
+			track();
+
+			GetROI( &imagesTrain[matchedIndex], &(matchedTraining[matchedIndex]), &(matchedQuery[matchedIndex]) );
+		}
+		else
+		{
+			matched = false;
+
+			computeDescriptors( imageCurrentQuery,
+				&keyPointsQueryByBRISK,
+				&keyPointsQueryByFREAK,
+				&descriptorsQueryByBRISK,
+				&descriptorsQueryByFREAK);
+
+			for(int i=0; i<NUMBER_OF_DB_IMAGES; ++i)
+			{
+				matchResult[i].matched = false;
+
+				match( &keyPointsQueryByBRISK, &keyPointsQueryByFREAK,
+					&(keyPointsTrainByBRISK[i]), &(keyPointsTrainByFREAK[i]),
+					&descriptorsQueryByBRISK, &descriptorsQueryByFREAK,
+					&(descriptorsTrainByBRISK[i]), &(descriptorsTrainByFREAK[i]),
+					&(matchResult[i]),
+					&(matchedTraining[i]), &(matchedQuery[i]));
+			}
+
+			// 매치된 영상 계산
+			//==============================
+			float maxMatchScore = -1;
+			int maxMatchScoreIndex = 0;
+
+			for(int i=0; i<NUMBER_OF_DB_IMAGES; ++i)
+			{
+				if(maxMatchScore < matchResult[i].match_score)
+				{
+					maxMatchScore = matchResult[i].match_score;
+					maxMatchScoreIndex = i;
+				}
+			}
+
+			if(maxMatchScore > MatchScoreThreshold){
+				// Buffer Frame을 두어서 몇 프레임 튀어서 다른 영상이 매칭 되어 보이는 현상을 제거함
+				// 대신 False Negative가 좀 더 늘 듯
+				//------------------------------
+				if( matchedIndex != maxMatchScoreIndex && number_of_buffer_images < NUMBER_OF_BUFFER_FRAMES)
+				{
+					number_of_buffer_images++;
+					matched = false;
+				}
+				else
+				{
+					matchedIndex = maxMatchScoreIndex;
+					matchResult[ matchedIndex ].matched = true;
+					matched = true;
+
+					number_of_buffer_images = 0;
+				}
+			}
+
+			// 호모그라피 계산
+			//------------------------------
+			if(matched)
+			{
+				GetROI( &imagesTrain[matchedIndex], &(matchedTraining[matchedIndex]), &(matchedQuery[matchedIndex]) );
+
+				if(matched)
+				{
+					if(beforeTrackingCount-- < 0)
+					//if(true)
+					{
+						toTrackingMode();
+
+						PAST = 0;
+						CURR = 1;
+
+						imageTracking[PAST] = imageCurrentMat.clone();
+
+						// 포인트 초기화
+						pointsTracking[PAST].clear();
+						for(int i=0; i<matchedQuery[matchedIndex].size(); ++i)
+							pointsTracking[PAST].push_back(cv::Point2f(matchedQuery[matchedIndex][i].x, matchedQuery[matchedIndex][i].y) );
+
+						//ofLogNotice("DETECTION to TRACKING");
+					}
+
+					// 3D 포즈 계산
+					//------------------------------
+					FindMarkerPos3d();
+				}
+			}
+		} // end of if - Tracking / Detection 모드 변환
+	} // end of if - 카메라 레디
+}
+
+//--------------------------------------------------------------
+void testApp::draw(){
+	//ofBackgroundGradient(200, 0);
+	ofBackground(ofColor::black);
+
+	string str;
+
+	// 모드에 따라 그릴 대상 설정
+	//------------------------------
+	vector<vector<cv::KeyPoint>>	*kpTrain;
+	vector<cv::KeyPoint>			*kpQuery;
+
+	switch(BRISKMode)
+	{
+	case MODE::BRISKK:
+		{
+			str = "[BRISK] ";
+			kpTrain = &keyPointsTrainByBRISK;	kpQuery = &keyPointsQueryByBRISK;
+
+			break;
+		} 
+	case MODE::FREAKK:
+		{
+			str = "[FREAK] ";
+			kpTrain = &keyPointsTrainByFREAK;	kpQuery = &keyPointsQueryByFREAK;
+
+			break;
+		}
+	case MODE::HYBRID:
+		{
+			str = "[HYBRID] ";
+			kpTrain = &keyPointsTrainByBRISK;	kpQuery = &keyPointsQueryByBRISK;
+
+			break;
+		}
+	}
+
+	if(bDrawWholeImages)
+		drawWholeImages(kpTrain, kpQuery);
+	else if(bDrawSixImages)
+		drawSixImages(kpTrain, kpQuery);
+	else if(bDrawSingieImage)
+		drawSingleImages(matchedIndex, kpTrain, kpQuery);
+	else if(bDrawFourImages)
+		drawFourImages(kpTrain, kpQuery);
+
+}
+
+void testApp::drawWholeImages(	vector<vector<cv::KeyPoint>>	*kpTrain, vector<cv::KeyPoint>			*kpQuery)
+{
+	if(bTrackingModeEnabled)
+		ofDrawBitmapString("TRACKING", ofGetScreenWidth()-50, 30);
+	else
+		ofDrawBitmapString("DETECTION", ofGetScreenWidth()-50, 30);
+
+	ofScale(0.3, 0.29);
+
+
+	float widthOfTwoImages = 0.0;
+	float heightOfWholeImages = 0.0;
+
+	ofPushMatrix();
+	for(int i=0; i<NUMBER_OF_DB_IMAGES; ++i)
+	{
+		// QUERY 영상 그리기
+		//==============================
+		imageCurrentQuery->draw(0, 0);
+
+		// 키포인트
+		//------------------------------
+		ofPushStyle();
+		if(bTrackingModeEnabled)
+		{
+			ofSetColor(ofColor::green);
+			for(int j=0; j<matchedQuery[matchedIndex].size(); ++j)
+			{
+				ofCircle(matchedQuery[matchedIndex][j], 10);
+			}
+		}
+		else
+		{
+			ofSetColor(ofColor::yellow);
+			for(int j=0; j < kpQuery->size(); j++)
+				ofCircle(ofPoint(kpQuery->at(j).pt.x, kpQuery->at(j).pt.y), 3);
+		}
+		ofPopStyle();
+
+		// TRAIN 영상 그리기
+		//==============================
+		ofPushMatrix();
+		ofTranslate(imageCurrentQuery->width, 0);
+
+		imagesTrain[i].draw(0, 0);
+
+		// Keypoints 그리기
+		//------------------------------
+		ofPushStyle();
+		ofFill();
+		if(bTrackingModeEnabled && i == matchedIndex)
+		{
+			ofSetColor(ofColor::red);
+			for(int j=0; j< matchedTraining[i].size(); ++j)
+			{
+				ofCircle(matchedTraining[i][j], 10);
+			}
+		}
+		else
+		{
+			ofSetColor(ofColor::blue);
+			vector<KeyPoint> * keypointsTrain = &(kpTrain->at(i));
+			for(int j=0; j<keypointsTrain->size(); ++j)
+			{
+				ofPoint p1;
+				p1.x = (*keypointsTrain)[j].pt.x;
+				p1.y = (*keypointsTrain)[j].pt.y;
+				ofCircle(p1, 3);
+			}
+		}
+		ofPopStyle();
+
+		ofPopMatrix();
+
+		// Match 그리기
+		//==============================
+		if(bDrawLine)
+		{
+			ofPushStyle();
+			ofSetColor(ofColor::red);
+			ofSetLineWidth(1);
+
+			//cout << "in draw: " << matchedQuery[i].size() << "\t" << matchedTraining[i].size() << "\t" << (matchedQuery[i].size() == matchedTraining[i].size() ? "EQ" : "NE") << endl;
+			for(int j=0; j<matchedQuery[i].size(); ++j)
+			{
+				ofLine(matchedQuery[i][j], ofPoint(matchedTraining[i][j].x + imageCurrentQuery->width, matchedTraining[i][j].y));
+			}
+			ofPopStyle();
+		}
+		if(bTrackingModeEnabled && i == matchedIndex)
+		{
+			ofPushStyle();
+			ofSetColor(ofColor::red);
+			ofSetLineWidth(1);
+
+			for(int j=0; j<matchedQuery[i].size(); ++j)
+			{
+				ofLine(matchedQuery[i][j], ofPoint(matchedTraining[i][j].x + imageCurrentQuery->width, matchedTraining[i][j].y));
+			}
+			ofPopStyle();
+		}
+
+		// True/False 상자 그리기
+		//------------------------------
+		ofPushStyle();
+		ofNoFill();
+		ofSetLineWidth(5);
+		if(matchResult[i].matched)
+			ofSetColor(ofColor::green);
+		else 
+			ofSetColor(ofColor::red);
+		ofRect(imageCurrentQuery->width, 0, imagesTrain[i].width, imagesTrain[i].height);
+		ofPopStyle();
+
+		// ROI 사각형 그리기
+		//------------------------------
+		if(matched && i == matchedIndex)
+		{
+			ofPushStyle();
+			ofSetLineWidth(3);
+			if(bTrackingModeEnabled)
+				ofSetColor(ofColor::yellow);
+			else
+				ofSetColor(ofColor::green);
+			for(int j=0; j<4; ++j)
+			{
+				ofLine(roi[j], roi[(j+1)%4]);
+			}
+			ofPopStyle();
+		}
+
+
+		// 텍스트 쓰기
+		//==============================
+		//str = ofToString( matchResult[i].matches_brisk_common.size() ) + "     " + ofToString( matchResult[i].matches_freak_common.size() ) + "      " + ofToString( matchResult[i].matches_hybrid_common.size() );
+		//ofDrawBitmapString(str, imageCurrentQuery->width + imagesTrain[i].width + 30, 100);
+
+
+		// 이미지 이동
+		if(i%4 == 3){
+			ofTranslate(widthOfTwoImages, -heightOfWholeImages);
+			heightOfWholeImages = 0;
+			widthOfTwoImages = 0;
+		}
+		else{
+			if(widthOfTwoImages < imageCurrentQuery->width + imagesTrain[i].width)
+				widthOfTwoImages = imageCurrentQuery->width + imagesTrain[i].width;
+			ofTranslate(0, imagesTrain[i].height);
+			heightOfWholeImages += imagesTrain[i].height;
+		}
+
+	}
+	ofPopMatrix();
+}
+
+void testApp::drawSixImages(	vector<vector<cv::KeyPoint>>	*kpTrain, vector<cv::KeyPoint>			*kpQuery)
+{
+	ofScale(0.55, 0.55);
+
+	float widthOfTwoImages;
+	float heightOfWholeImages = 0.0;
+
+	ofPushMatrix();
+	for(int i=0; i<6; ++i)
+	{
+		//if(i == 5) continue;
+		// QUERY 영상 그리기
+		//==============================
+		imageCurrentQuery->draw(0, 0);
+
+		// 키포인트
+		//------------------------------
+		ofPushStyle();
+		ofSetColor(ofColor::yellow);
+		for(int i=0; i < kpQuery->size(); i++)
+			ofCircle(ofPoint(kpQuery->at(i).pt.x, kpQuery->at(i).pt.y), 3);
+		ofPopStyle();
+
+		// TRAIN 영상 그리기
+		//==============================
+		ofPushMatrix();
+		ofTranslate(imageCurrentQuery->width, 0);
+
+		imagesTrain[i].draw(0, 0);
+
+		// Keypoints 그리기
+		//------------------------------
+		ofPushStyle();
+		ofFill();
+		ofSetColor(ofColor::blue);
+		vector<KeyPoint> * keypointsTrain = &(kpTrain->at(i));
+		for(int j=0; j<keypointsTrain->size(); ++j)
+		{
+			ofPoint p1;
+			p1.x = (*keypointsTrain)[j].pt.x;
+			p1.y = (*keypointsTrain)[j].pt.y;
+			ofCircle(p1, 3);
+		}
+		ofPopStyle();
+
+		ofPopMatrix();
+
+		// Match 그리기
+		//==============================
+		if(bDrawLine)
+		{
+			ofPushStyle();
+			ofSetColor(ofColor::red);
+			ofSetLineWidth(1);
+
+			//cout << "in draw: " << matchedQuery[i].size() << "\t" << matchedTraining[i].size() << "\t" << (matchedQuery[i].size() == matchedTraining[i].size() ? "EQ" : "NE") << endl;
+			for(int j=0; j<matchedQuery[i].size(); ++j)
+			{
+				ofLine(matchedQuery[i][j], ofPoint(matchedTraining[i][j].x + imageCurrentQuery->width, matchedTraining[i][j].y));
+			}
+			ofPopStyle();
+		}
+
+		// True/False 상자 그리기
+		//------------------------------
+		ofPushStyle();
+		ofNoFill();
+		ofSetLineWidth(10);
+		if(matchResult[i].matched)
+			ofSetColor(ofColor::green);
+		else 
+			ofSetColor(ofColor::red);
+		ofRect(imageCurrentQuery->width, 0, imagesTrain[i].width, imagesTrain[i].height);
+		ofPopStyle();
+
+		// ROI 사각형 그리기
+		//------------------------------
+		if(matched && i == matchedIndex)
+		{
+			ofPushStyle();
+			ofSetLineWidth(3);
+			ofSetColor(ofColor::green);
+			for(int j=0; j<4; ++j)
+			{
+				ofLine(roi[j], roi[(j+1)%4]);
+			}
+			ofPopStyle();
+		}
+
+
+		// 텍스트 쓰기
+		//==============================
+		//str = ofToString( matchResult[i].matches_brisk_common.size() ) + "     " + ofToString( matchResult[i].matches_freak_common.size() ) + "      " + ofToString( matchResult[i].matches_hybrid_common.size() );
+		//ofDrawBitmapString(str, imageCurrentQuery->width + imagesTrain[i].width + 30, 100);
+
+
+		// 이미지 이동
+		if(i%2 == 1){
+			ofTranslate(widthOfTwoImages, -heightOfWholeImages);
+			heightOfWholeImages = 0;
+			widthOfTwoImages = 0;
+		}
+		else{
+			if(widthOfTwoImages < imageCurrentQuery->width + imagesTrain[i].width)
+				widthOfTwoImages = imageCurrentQuery->width + imagesTrain[i].width;
+			ofTranslate(0, imagesTrain[i].height);
+			heightOfWholeImages += imagesTrain[i].height;
+		}
+
+	}
+	ofPopMatrix();
+}
+
+void testApp::drawFourImages(	vector<vector<cv::KeyPoint>>	*kpTrain, vector<cv::KeyPoint>			*kpQuery)
+{
+	ofScale(0.8, 0.8);
+
+	float widthOfTwoImages = 0.0;
+	float heightOfWholeImages = 0.0;
+
+	string str;
+
+	ofPushMatrix();
+	for(int i=0; i<4; ++i)
+	{
+		// 글자 쓰기	-	Query
+		//------------------------------
+		ofPushStyle();
+		ofSetColor(ofColor::white);
+		str = "Query";
+		font.drawString(str, 30, 40);
+		str = "Reference";
+		font.drawString(str, imageCurrentQuery->width + 30, 40);
+		ofPopStyle();
+
+		ofTranslate(0, 60);
+
+		// QUERY 영상 그리기
+		//==============================
+		imageCurrentQuery->draw(0, 0);
+
+		// 키포인트
+		//------------------------------
+		ofPushStyle();
+		ofSetColor(ofColor::yellow);
+		if(bTrackingModeEnabled && i == matchedIndex)
+		{
+			for(int j=0; j<matchedQuery[i].size(); ++j)
+			{
+				ofCircle(matchedQuery[i][j], 3);
+			}
+		}
+		else
+		{
+			for(int j=0; j < kpQuery->size(); j++)
+				ofCircle(ofPoint(kpQuery->at(j).pt.x, kpQuery->at(j).pt.y), 3);
+
+		}
+		ofPopStyle();
+
+		// TRAIN 영상 그리기
+		//==============================
+		ofPushMatrix();
+		ofTranslate(imageCurrentQuery->width, 0);
+
+		imagesTrain[i].draw(0, 0);
+
+		// Keypoints 그리기
+		//------------------------------
+		ofPushStyle();
+		ofFill();
+		ofSetColor(ofColor::blue);
+		if(bTrackingModeEnabled && i == matchedIndex)
+		{
+			for(int j=0 ;j< matchedTraining[i].size(); ++j)
+				ofCircle(matchedTraining[i][j], 3);
+		}
+		else
+		{
+			vector<KeyPoint> * keypointsTrain = &(kpTrain->at(i));
+			for(int j=0; j<keypointsTrain->size(); ++j)
+			{
+				ofPoint p1;
+				p1.x = (*keypointsTrain)[j].pt.x;
+				p1.y = (*keypointsTrain)[j].pt.y;
+				ofCircle(p1, 3);
+			}
+		}
+		ofPopStyle();
+
+		ofPopMatrix();
+
+		// Match 그리기
+		//==============================
+		if(true)
+		{
+			ofPushStyle();
+			ofSetColor(ofColor::red);
+			ofSetLineWidth(1);
+
+			//cout << "in draw: " << matchedQuery[i].size() << "\t" << matchedTraining[i].size() << "\t" << (matchedQuery[i].size() == matchedTraining[i].size() ? "EQ" : "NE") << endl;
+			for(int j=0; j<matchedQuery[i].size(); ++j)
+			{
+				ofLine(matchedQuery[i][j], ofPoint(matchedTraining[i][j].x + imageCurrentQuery->width, matchedTraining[i][j].y));
+			}
+			ofPopStyle();
+		}
+
+		// True/False 상자 그리기
+		//------------------------------
+		ofPushStyle();
+		ofNoFill();
+		ofSetLineWidth(30);
+		if(matchResult[i].matched)
+			ofSetColor(ofColor::green);
+		else 
+			ofSetColor(ofColor::red);
+		ofRect(imageCurrentQuery->width, 0, imagesTrain[i].width, imagesTrain[i].height);
+		ofPopStyle();
+
+		// ROI 사각형 그리기
+		//------------------------------
+		if(matched && i == matchedIndex)
+		{
+			ofPushStyle();
+			ofSetLineWidth(3);
+			ofSetColor(ofColor::green);
+			for(int j=0; j<4; ++j)
+			{
+				ofLine(roi[j], roi[(j+1)%4]);
+			}
+			ofPopStyle();
+		}
+
+		// 이미지 이동
+		if(i%2 == 1){
+			ofTranslate(widthOfTwoImages+50, -heightOfWholeImages-130);
+			heightOfWholeImages = 0;
+			widthOfTwoImages = 0;
+		}
+		else{
+			if(widthOfTwoImages < imageCurrentQuery->width + imagesTrain[i].width)
+				widthOfTwoImages = imageCurrentQuery->width + imagesTrain[i].width;
+			ofTranslate(0, imagesTrain[i].height + 130);
+			heightOfWholeImages += imagesTrain[i].height + 130;
+		}
+
+	}
+	ofPopMatrix();
+}
+
+
+void testApp::drawSingleImages(	int i, vector<vector<cv::KeyPoint>>	*kpTrain, vector<cv::KeyPoint>			*kpQuery)
+{
+	easyCam.begin();
+	//ofScale(1, -1, 1);
+	//ofTranslate(-ofGetScreenWidth() / 2.0, -ofGetScreenHeight() / 2.0);
+
+	ofPushMatrix();
+	// QUERY 영상 그리기
+	//==============================
+	imageCurrentQuery->draw(0, 0);
+
+	// 키포인트
+	//------------------------------
+	ofPushStyle();
+	ofSetColor(ofColor::yellow);
+	if(bTrackingModeEnabled && i == matchedIndex)
+	{
+		for(int j=0; j< matchedQuery[i].size(); ++j)
+			ofCircle(matchedQuery[i][j], 3);
+	}
+	else
+	{
+		for(int i=0; i < kpQuery->size(); i++)
+			ofCircle(ofPoint(kpQuery->at(i).pt.x, kpQuery->at(i).pt.y), 3);
+	}
+	ofPopStyle();
+
+	// TRAIN 영상 그리기
+	//==============================
+	ofPushMatrix();
+	ofTranslate(imageCurrentQuery->width, 0);
+
+	imagesTrain[i].draw(0, 0);
+
+	// Keypoints 그리기
+	//------------------------------
+	ofPushStyle();
+	ofFill();
+	ofSetColor(ofColor::blue);
+	if(bTrackingModeEnabled && i == matchedIndex)
+	{
+		for(int j=0; j< matchedTraining[i].size(); ++j)
+			ofCircle(matchedTraining[i][j], 3);
+	}
+	else
+	{
+		vector<KeyPoint> * keypointsTrain = &(kpTrain->at(i));
+		for(int j=0; j<keypointsTrain->size(); ++j)
+		{
+			ofPoint p1;
+			p1.x = (*keypointsTrain)[j].pt.x;
+			p1.y = (*keypointsTrain)[j].pt.y;
+			ofCircle(p1, 3);
+		}
+	}
+	ofPopStyle();
+
+	ofPopMatrix();
+
+	// Match 그리기
+	//==============================
+	if(true)
+	{
+		ofPushStyle();
+		ofSetColor(ofColor::red);
+		ofSetLineWidth(1);
+
+		//cout << "in draw: " << matchedQuery[i].size() << "\t" << matchedTraining[i].size() << "\t" << (matchedQuery[i].size() == matchedTraining[i].size() ? "EQ" : "NE") << endl;
+		for(int j=0; j<matchedQuery[i].size(); ++j)
+		{
+			ofLine(matchedQuery[i][j], ofPoint(matchedTraining[i][j].x + imageCurrentQuery->width, matchedTraining[i][j].y));
+		}
+		ofPopStyle();
+	}
+
+	// ROI 사각형 그리기
+	//------------------------------
+	if(matched && i == matchedIndex)
+	{
+		ofPushStyle();
+		ofSetLineWidth(3);
+		ofSetColor(ofColor::green);
+		for(int j=0; j<4; ++j)
+		{
+			ofLine(roi[j], roi[(j+1)%4]);
+		}
+		ofPopStyle();
+		
+
+		// 3D 모델 그려주기
+		//==============================
+
+		ofPushMatrix();
+		ofPushStyle();
+
+
+		//ofTranslate(tran[0], tran[1], tran[2]);
+
+		//object load
+		model.update();
+
+		ofRotate(-90, 1, 0, 0);
+		ofRotate((int)(-rot[2] * 57.2957795) ,0,  1,0);
+		//ofScale(0.2f, 0.2f, 0.2f);
+		ofTranslate(roi[0].x, roi[0].y);
+
+		// 모델 그리기
+		model.drawFaces();
+		// 축 그리기
+		//ofDrawAxis(100);
+
+
+
+		//ofRotateY(90);
+		//ofDrawGridPlane(500);
+		//ofRotateY(-90);
+
+		//ofTranslate(imageCurrentQuery->width / 2.0, imageCurrentQuery->height / 2.0);
+		//ofTranslate(tran[0], tran[1], 0);
+		//ofSetColor(ofColor::red);
+		//ofFill();
+		//ofSphere(50);
+		
+		//cout << "EASY CAM : " << easyCam.getPosition() << endl;
+
+
+		ofPopStyle();
+		ofPopMatrix();
+		
+	}
+
+	ofPopMatrix();
+	
+	easyCam.end();
+}
+
+
+//--------------------------------------------------------------
+void testApp::keyPressed(int key){
+	if(key == 'f')
+		ofToggleFullscreen();
+	if(key == 'l')
+		bDrawLine = !bDrawLine;
+	if(key == 'b'){
+#define GetBRISKModeToString(mode)	( mode == MODE::BRISKK ? "BRISK" : ( mode == MODE::FREAKK ? "FREAK" : "HYBRID") )
+		string str = GetBRISKModeToString(BRISKMode);
+		BRISKMode = (BRISKMode == MODE::BRISKK) ? MODE::FREAKK : ( (BRISKMode == MODE::FREAKK ? MODE::HYBRID : MODE::BRISKK) );
+		str += ">";
+		str += GetBRISKModeToString(BRISKMode);
+
+		ofLogNotice("BRISK Mode Changed",  str);
+	}
+	if(key == 'w') {
+		bDrawWholeImages = true;
+
+		bDrawSixImages = false;
+		bDrawSingieImage = false;
+		bDrawFourImages = false;
+	} 
+	if(key == '6') {
+		bDrawSixImages = true;
+
+		bDrawWholeImages = false;
+		bDrawSingieImage = false;
+		bDrawFourImages = false;
+	}
+	if(key == '1'){
+		bDrawSingieImage = true;
+
+		bDrawSixImages = false;
+		bDrawWholeImages = false;
+		bDrawFourImages = false;
+	}
+	if(key == '4')
+	{
+		bDrawFourImages = true;
+
+		bDrawSingieImage = false;
+		bDrawSixImages = false;
+		bDrawWholeImages = false;
+	}
+	if(key == 't')
+		bUseTrackingMode = !bUseTrackingMode;
+}
+
+
+//--------------------------------------------------------------
+void testApp::keyReleased(int key){
+
+}
+
+//--------------------------------------------------------------
+void testApp::mouseMoved(int x, int y ){
+
+}
+
+//--------------------------------------------------------------
+void testApp::mouseDragged(int x, int y, int button){
+
+}
+
+//--------------------------------------------------------------
+void testApp::mousePressed(int x, int y, int button){
+
+}
+
+//--------------------------------------------------------------
+void testApp::mouseReleased(int x, int y, int button){
+
+}
+
+//--------------------------------------------------------------
+void testApp::windowResized(int w, int h){
+
+}
+
+//--------------------------------------------------------------
+void testApp::gotMessage(ofMessage msg){
+
+}
+
+//--------------------------------------------------------------
+void testApp::dragEvent(ofDragInfo dragInfo){ 
+
+}
+
+//--------------------------------------------------------------
+void testApp::exit(){
+
+}
+
+void testApp::computeDescriptors(ofImage * image, vector<cv::KeyPoint> * keyPointsByBRISK, vector<cv::KeyPoint> * keyPointsByFREAK
+												, cv::Mat * descriptorsByBRISK, cv::Mat * descriptorsByFREAK)
+{
+	// ofImage -> OpenCV Mat (BGR)
+	//------------------------------
+	cv::Mat mat(image->getHeight(), image->getWidth(), CV_8UC3, image->getPixels());
+	cv::cvtColor(mat, mat, CV_RGB2BGR);
+
+	// OpenCV Mat(BGR) -> OpenCV Mat(Gray)
+	cv::cvtColor(mat, imageCurrentMat, CV_BGR2GRAY);
+
+	// 키포인트 찾고 디스크립터 계산
+	//------------------------------
+	vector<cv::KeyPoint>	kp, kpByBRISK, kpByFREAK;
+	////gcKeypointsRecover(kpByFREAK, *keyPointsByFREAK, kp);			// <-- 이건 필요한건가?
+
+
+	// BRISK 저자 코드
+	//------------------------------
+	brisk_from_author->detect(imageCurrentMat, *keyPointsByBRISK);
+	descriptorExtractor_brisk->compute(imageCurrentMat, *keyPointsByBRISK, *descriptorsByBRISK);
+
+	// FREAK 저자 코드
+	//------------------------------
+	*keyPointsByFREAK = *keyPointsByBRISK;
+
+	//keyPointsByFREAKFromAuthor = keyPointsByBRISKFromAuthor;
+	//brisk_from_author->detect(mat_gray, *keyPointsByBRISKFromAuthor);
+	descriptorExtractor_freak->compute(imageCurrentMat, *keyPointsByFREAK, *descriptorsByFREAK);
+}
+
+float testApp::match(	vector<cv::KeyPoint> * keyPointsQueryByBRISK, vector<cv::KeyPoint> * keyPointsQueryByFREAK, 
+						vector<cv::KeyPoint> * keyPointsTrainByBRISK, vector<cv::KeyPoint> * keyPointsTrainByFREAK, 
+						cv::Mat * descriptorsQueryByBRISK, cv::Mat *descriptorsQueryByFREAK, 
+						cv::Mat * descriptorsTrainByBRISK, cv::Mat *descriptorsTrainByFREAK,
+						struct MatchResult * matchResult,
+						vector<ofPoint> * matchedTraining, vector<ofPoint> * matchedQuery)
+{
+	if(keyPointsQueryByBRISK->size() == 0 || keyPointsQueryByFREAK->size() == 0)
+		return -1;
+
+	vector<DMatch> * matches_brisk			= &(matchResult->matches_brisk);
+	vector<DMatch> * matches_brisk_opp		= &(matchResult->matches_brisk_opp);
+	vector<DMatch> * matches_brisk_common	= &(matchResult->matches_brisk_common);
+
+	vector<DMatch> * matches_freak			= &(matchResult->matches_freak);
+	vector<DMatch> * matches_freak_opp		= &(matchResult->matches_freak_opp);
+	vector<DMatch> * matches_freak_common	= &(matchResult->matches_freak_common);
+	
+	vector<DMatch> * matches_hybrid			= &(matchResult->matches_hybrid);
+	vector<DMatch> * matches_hybridk_opp	= &(matchResult->matches_hybrid_opp);
+	vector<DMatch> * matches_hybrid_common	= &(matchResult->matches_hybrid_common);
+
+	// Initialize
+	//------------------------------
+	matches_hybrid->clear();
+	matches_hybridk_opp->clear();
+	matches_brisk_common->clear();
+	matches_freak_common->clear();
+	matches_hybrid_common->clear();
+
+	// Matching
+	//------------------------------
+	matcher->match(*descriptorsQueryByBRISK, *descriptorsTrainByBRISK, *matches_brisk);
+	matcher->match(*descriptorsTrainByBRISK, *descriptorsQueryByBRISK, *matches_brisk_opp);
+
+	matcher->match(*descriptorsQueryByFREAK, *descriptorsTrainByFREAK, *matches_freak);
+	matcher->match(*descriptorsTrainByFREAK, *descriptorsQueryByFREAK, *matches_freak_opp);
+
+	//BRISK+FREAK matching
+	//------------------------------
+	for(int i=0 ; i<matches_brisk->size() ; i++)
+	{
+		for(int j=0 ; j<matches_freak->size() ; j++)
+		{
+			if(    (keyPointsQueryByBRISK->at(matches_brisk->at(i).queryIdx).pt.x == keyPointsQueryByFREAK->at( matches_freak->at(j).queryIdx ).pt.x) 
+				&& (keyPointsQueryByBRISK->at(matches_brisk->at(i).queryIdx).pt.y == keyPointsQueryByFREAK->at( matches_freak->at(j).queryIdx ).pt.y) 
+
+				&& (keyPointsTrainByBRISK->at(matches_brisk->at(i).trainIdx).pt.x == keyPointsTrainByFREAK->at( matches_freak->at(j).trainIdx ).pt.x)   
+				&& (keyPointsTrainByBRISK->at(matches_brisk->at(i).trainIdx).pt.y == keyPointsTrainByFREAK->at( matches_freak->at(j).trainIdx ).pt.y)  )
+			{
+				matches_hybrid->push_back(matches_brisk->at(i));
+			}
+		}
+	}
+	
+	for(int i=0 ; i<matches_brisk_opp->size() ; i++)
+	{
+		for(int j=0 ; j<matches_freak_opp->size() ; j++)
+		{
+			if(    (keyPointsQueryByBRISK->at(matches_brisk_opp->at(i).trainIdx).pt.x == keyPointsQueryByFREAK->at( matches_freak_opp->at(j).trainIdx ).pt.x) 
+				&& (keyPointsQueryByBRISK->at(matches_brisk_opp->at(i).trainIdx).pt.y == keyPointsQueryByFREAK->at( matches_freak_opp->at(j).trainIdx ).pt.y) 
+
+				&& (keyPointsTrainByBRISK->at(matches_brisk_opp->at(i).queryIdx).pt.x == keyPointsTrainByFREAK->at( matches_freak_opp->at(j).queryIdx ).pt.x)   
+				&& (keyPointsTrainByBRISK->at(matches_brisk_opp->at(i).queryIdx).pt.y == keyPointsTrainByFREAK->at( matches_freak_opp->at(j).queryIdx ).pt.y)  )
+			{
+				matches_hybridk_opp->push_back(matches_brisk_opp->at(i));
+			}
+		}
+	}
+
+	// 양방향 필터링
+	//------------------------------
+	gcFilterMatches(* matches_brisk, * matches_brisk_opp, *matches_brisk_common, * keyPointsQueryByBRISK, * keyPointsTrainByBRISK);
+	gcFilterMatches(* matches_freak, * matches_freak_opp, *matches_freak_common, * keyPointsQueryByFREAK, * keyPointsTrainByFREAK);
+	
+	gcFilterMatches(* matches_hybrid, * matches_hybridk_opp, *matches_hybrid_common, * keyPointsQueryByBRISK, * keyPointsTrainByBRISK);
+
+
+	// 매칭 포인트 출력
+	//------------------------------
+	vector<cv::DMatch>				*matches;
+	vector<cv::KeyPoint>			*kpTrain;
+	vector<cv::KeyPoint>			*kpQuery;
+
+	switch(BRISKMode)
+	{
+	case MODE::BRISKK:
+		kpTrain = keyPointsTrainByBRISK;
+		kpQuery = keyPointsQueryByBRISK;
+		matches = matches_brisk_common;
+		break;
+	case MODE::FREAKK:
+		kpTrain = keyPointsTrainByFREAK;
+		kpQuery = keyPointsQueryByFREAK;
+		matches = matches_freak_common;
+		break;
+	case MODE::HYBRID:
+		kpTrain = keyPointsTrainByBRISK;
+		kpQuery = keyPointsQueryByBRISK;
+		matches = matches_hybrid_common;
+		break;
+
+	}
+	matchedTraining->clear();
+	matchedQuery->clear();
+	for(int j=0; j<matches->size(); ++j)
+	{
+		ofPoint p1;
+		p1.x = kpTrain->at(matches->at(j).trainIdx).pt.x;
+		p1.y = kpTrain->at(matches->at(j).trainIdx).pt.y;
+
+		cv::Point2f p = kpQuery->at( matches->at(j).queryIdx ).pt;
+
+		ofPoint p2(p.x, p.y);
+
+		matchedTraining->push_back(p1);
+		matchedQuery->push_back(p2);
+	}
+
+	//cout << "in match: " << matchedQuery->size() << "\t" << matchedTraining->size() << "\t" << (matchedQuery->size() == matchedTraining->size()  ? "EQ" : "NE") << endl;
+
+	// 모드에 따라 리턴
+	//------------------------------
+	switch(BRISKMode)
+	{
+	case MODE::BRISKK:
+		return (matchResult->match_score = matches_brisk_common->size());
+	case MODE::FREAKK:
+		return (matchResult->match_score = matches_freak_common->size());
+	case MODE::HYBRID:
+		return (matchResult->match_score = matches_hybrid_common->size());
+	}
+
+	return -1;
+}
+
+
+void testApp::GetROI( ofImage * imageTrain, vector<ofPoint> * matchedQuery, vector<ofPoint> * matchedTraining)
+{
+	vector<cv::Point2f> pointsQuery = convertOF2CV(matchedQuery), pointsTraining = convertOF2CV(matchedTraining);
+
+	Mat H = findHomography(pointsQuery, pointsTraining, RANSAC, ReprojThreshold);
+
+	vector<Point2f> obj_corners1(4);
+	obj_corners1[0] = cvPoint(0,0); 
+	obj_corners1[1] = cvPoint( imageTrain->width, 0 );
+	obj_corners1[2] = cvPoint( imageTrain->width, imageTrain->height); 
+	obj_corners1[3] = cvPoint( 0, imageTrain->height );	
+
+	//Convert Object Corners to Transformed Object Corners Using Homography Matrix Information
+	
+	perspectiveTransform( obj_corners1, dst_matching_corners, H);
+
+	if(!niceHomography(&H))
+	{
+		toDetectionMode();
+
+		return;
+	}
+
+	float ratio = 0.8;
+	for(int i=0; i<4; ++i){
+		roi[i].x = dst_matching_corners[i].x * ratio + roi[i].x * (1-ratio);
+		roi[i].y = dst_matching_corners[i].y * ratio + roi[i].y * (1-ratio);
+	}
+}
+
+vector<cv::Point2f> testApp::convertOF2CV(vector<ofPoint> * source)
+{
+	vector<cv::Point2f>	destination;
+
+	for(int i=0; i<source->size(); ++i)
+		destination.push_back( cv::Point2f(source->at(i).x, source->at(i).y) );
+	
+	return destination;
+}
+
+vector<ofPoint> testApp::convertCV2OF(vector<cv::Point2f> * source)
+{
+	vector<ofPoint> destination;
+	
+	for(int i=0; i<source->size(); ++i)
+		destination.push_back( ofPoint(source->at(i).x, source->at(i).y) );
+
+	return destination;
+}
+
+#define GetMatrixValue(m, x, y)	(m->at<double>(x, y))
+// Returns whether H is a nice homography matrix or not
+bool testApp::niceHomography(const Mat * H)
+{
+	const double det = GetMatrixValue(H, 0, 0) * GetMatrixValue(H, 1, 1) - GetMatrixValue(H, 1, 0) * GetMatrixValue(H, 0, 1);
+	if (det < 0)
+		return false;
+
+	const double N1 = sqrt(GetMatrixValue(H, 0, 0) * GetMatrixValue(H, 0, 0) + GetMatrixValue(H, 1, 0) * GetMatrixValue(H, 1, 0));
+	if (N1 > 4 || N1 < 0.1)
+		return false;
+
+	const double N2 = sqrt(GetMatrixValue(H, 0, 1) * GetMatrixValue(H, 0, 1) + GetMatrixValue(H, 1, 1) * GetMatrixValue(H, 1, 1));
+	if (N2 > 4 || N2 < 0.1)
+		return false;
+
+	const double N3 = sqrt(GetMatrixValue(H, 2, 0) * GetMatrixValue(H, 2, 0) + GetMatrixValue(H, 2, 1) * GetMatrixValue(H, 2, 1));
+	if (N3 > 0.002)
+		return false;
+
+	return true;
+}
+
+void testApp::track()
+{
+	// 이전 결과 벡터 초기화
+	//------------------------------
+	statusTracking.clear();
+	errorTracking.clear();
+
+	// 환경 변수 초기화
+	//------------------------------
+	TermCriteria termcrit(CV_TERMCRIT_ITER|CV_TERMCRIT_EPS,10,0.15);
+	cv::Size subPixWinSize(10,10), winSize(50,50);
+
+
+	// 현재 영상 Mat형으로 변환
+	//==============================
+	// ofImage -> OpenCV Mat (BGR)
+	//------------------------------
+	cv::Mat mat(imageCurrentQuery->getHeight(), imageCurrentQuery->getWidth(), CV_8UC3, imageCurrentQuery->getPixels());
+	cv::cvtColor(mat, mat, CV_RGB2BGR);
+
+	// OpenCV Mat(BGR) -> OpenCV Mat(Gray)
+	cv::cvtColor(mat, imageTracking[CURR], CV_BGR2GRAY);
+
+	// TRACKING
+	//==============================
+	//CV_EXPORTS_W void calcOpticalFlowPyrLK( InputArray prevImg, InputArray nextImg,
+	//	InputArray prevPts, CV_OUT InputOutputArray nextPts,
+	//	OutputArray status, OutputArray err,
+	//	Size winSize=Size(21,21), int maxLevel=3,
+	//	TermCriteria criteria=TermCriteria(TermCriteria::COUNT+TermCriteria::EPS, 30, 0.01),
+	//	int flags=0, double minEigThreshold=1e-4);
+	calcOpticalFlowPyrLK(imageTracking[PAST], imageTracking[CURR],
+		pointsTracking[PAST], pointsTracking[CURR],
+		statusTracking, errorTracking,
+		winSize, 1, termcrit/*, 0, 0, 0.001*/);
+
+	for(int i = statusTracking.size()-1; i >= 0 ; --i)
+	{
+		if(!statusTracking[i])
+		{
+			pointsTracking[CURR].erase(pointsTracking[CURR].begin() + i);
+
+			matchedQuery[matchedIndex].erase(matchedQuery[matchedIndex].begin() + i);
+			matchedTraining[matchedIndex].erase(matchedTraining[matchedIndex].begin() + i);
+		} 
+		else
+		{
+			matchedQuery[matchedIndex][i].x = pointsTracking[CURR][i].x;
+			matchedQuery[matchedIndex][i].y = pointsTracking[CURR][i].y;
+		}
+	}
+
+	if(pointsTracking[CURR].size() <= 5){
+		toDetectionMode();
+	}
+
+	int temp = PAST;
+	PAST = CURR;
+	CURR = temp;
+}
+
+void testApp::toTrackingMode()
+{
+	bTrackingModeEnabled = true;
+	matched = true;
+	
+	bDrawLine = false;
+
+	beforeTrackingCount = 0;
+}
+void testApp::toDetectionMode()
+{
+	bTrackingModeEnabled = false;
+	matched = false;
+
+	bDrawLine = true;
+}
+
+void testApp::FindMarkerPos3d ()
+{
+	if (_calib._intrinsic_matrix && _calib._distortion_coeffs);
+	else return;
+
+	
+
+	// 회전(rotation)과 이동(translation)을 계산하여 저장할 매트릭스 생성
+	CvMat rotation    = cvMat(3, 1, CV_32FC1, rot);
+	CvMat translation = cvMat(3, 1, CV_32FC1, tran);
+
+	float image_xy[4][2] = {
+		{ roi[0].x, roi[0].y },
+		{ roi[1].x, roi[1].y },
+		{ roi[2].x, roi[2].y },
+		{ roi[3].x, roi[3].y },
+	};
+
+	// 중점이 원점
+	float object_xyz[4][3] = {
+		{ -55.0f,	105.0f,			0.0f },
+		{ 55.f,		105.0f,			0.0f },
+		{ 55.f,		-105.f,			0.0f },
+		{ -55.0f,	-105.f,			0.0f },
+	};
+	//float object_xyz[4][3] = {
+	//	{ 0.0f,		0.0f,			0.0f },
+	//	{ 110.f,	0.0f,			0.0f },
+	//	{ 110.f,	210.f,			0.0f },
+	//	{ 0.0f,		210.f,			0.0f },
+	//};
+
+	CvMat object_points = cvMat(4, 3, CV_32FC1, &object_xyz[0][0]);
+	CvMat image_points  = cvMat(4, 2, CV_32FC1, &image_xy[0][0]);
+	// 3차원 공간에서 마커의 위치와 방위를 찾는다.
+	cvFindExtrinsicCameraParams2 (&object_points, &image_points, 
+		_calib._intrinsic_matrix, _calib._distortion_coeffs, 
+		&rotation, &translation);  
+	
+
+	printf("ROI[0] (%.1f,%.1f)   Translate (%.1f,%.1f,%.1f)\n" , roi[0].x, roi[0].y, tran[0],tran[1],tran[2]);
+	
+}
